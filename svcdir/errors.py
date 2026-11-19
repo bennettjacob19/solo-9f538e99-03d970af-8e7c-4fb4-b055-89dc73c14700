@@ -71,6 +71,31 @@ class DatabaseBusy(DirectoryError):
         super().__init__("数据库繁忙，请稍后重试")
 
 
+class StorageFull(DirectoryError):
+    """The database hit its page cap (or the disk is full).
+
+    This is deliberately distinct from :class:`DatabaseError`: the request was
+    valid, but committing it would exceed the configured page limit.  The
+    rejected transaction is rolled back, so the previously committed directory
+    and all named backups are intact and the same request can be retried
+    unchanged once space has been reclaimed.
+    """
+
+    status_code = 507
+    code = "storage_full"
+
+    def __init__(
+        self,
+        message: str = (
+            "存储空间不足：数据库已达到页数上限，本次修改未保存。"
+            "请释放历史空间或提高页数上限后，使用原内容重试。"
+        ),
+        *,
+        details: list[str] | None = None,
+    ) -> None:
+        super().__init__(message, details=details)
+
+
 class DatabaseError(DirectoryError):
     status_code = 500
     code = "database_error"

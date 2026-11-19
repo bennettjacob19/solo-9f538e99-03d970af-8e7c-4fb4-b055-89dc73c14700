@@ -7,9 +7,17 @@ Design summary
   version is a single ``UPDATE meta ... current_version`` statement.
 * A reader pins one version inside one SQLite read transaction (WAL snapshot
   isolation), so it can never observe a mixture of the directory before and
-  after a restore.  Old versions and their rows are never deleted.
+  after a restore.  A version and its rows are garbage-collected once neither
+  ``current_version`` nor a named backup references them.
 * A named backup pins the current version id at a single commit point, so it is
   always a complete directory even while writes keep arriving.
+* Space is reclaimed: every write first deletes the history of versions that
+  are no longer referenced by the current directory or any named backup.  The
+  freed pages are reused by the same transaction, so a page-capped database
+  (``PRAGMA max_page_count``) can keep accepting edits once old history is
+  collected.  With an unchanged number of services and named backups, repeated
+  address changes do not make the file grow with the number of commits.  A
+  legacy database written by an older release is reclaimed once at startup.
 * A restore is: mark a lease -> validate the backup -> atomically create a new
   version copied from the backup and switch ``current_version``.  The switch is
   one transaction: after a crash/restart the directory is either the original
@@ -17,6 +25,9 @@ Design summary
 * While a restore holds a live lease, writes are rejected with
   ``RestoreInProgress``.  An expired lease (crashed restorer) is reclaimed, and
   a restorer that lost its lease aborts instead of overwriting newer state.
+* Hitting the page cap surfaces as ``StorageFull`` (HTTP 507), not a generic
+  database error.  The failed transaction rolled back, so the last committed
+  directory and every backup survive and the request can be retried verbatim.
 """
 
 from __future__ import annotations
@@ -48,6 +59,7 @@ from .errors import (
     InputError,
     NotFoundError,
     RestoreInProgress,
+    StorageFull,
 )
 
 SCHEMA_VERSION = 1
@@ -56,6 +68,22 @@ MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
 MAX_BACKUP_NAME_LENGTH = 64
 MAX_NOTE_LENGTH = 200
+
+# SQLite's default unlimited ``PRAGMA max_page_count``.
+SQLITE_DEFAULT_MAX_PAGE_COUNT = 1073741823
+
+# SQLite result codes.  ``sqlite3`` exposes ``sqlite_errorcode`` /
+# ``sqlite_errorname`` from Python 3.11; older versions only give the message.
+_SQLITE_FULL = 13
+_SQLITE_IOERR_FULL = 10 | (_SQLITE_FULL << 8)  # 3338
+_FULL_ERROR_NAMES = frozenset({"SQLITE_FULL", "SQLITE_IOERR_FULL"})
+_FULL_MESSAGE_MARKERS = (
+    "database or disk is full",
+    "database or disk full",
+    "disk is full",
+    "disk full",
+    "no space left",
+)
 
 SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -77,6 +105,24 @@ def _text(raw: Any, field: str) -> str:
     if not isinstance(raw, str):
         raise InputError(f"{field}必须是字符串")
     return raw.strip()
+
+
+def _env_page_cap() -> int | None:
+    """Optional page cap from ``SVCDIR_MAX_PAGE_COUNT`` (None = SQLite default).
+
+    SQLite enforces ``PRAGMA max_page_count`` per connection; a database that
+    reaches the cap fails writes with SQLITE_FULL.  Keeping the cap outside the
+    file makes it possible to model a page-limited deployment in tests and to
+    raise the limit without rewriting the database.
+    """
+    raw = os.environ.get("SVCDIR_MAX_PAGE_COUNT", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def validate_service_name(raw: Any) -> str:
@@ -138,7 +184,20 @@ def _compute_digest(backup_name: str, version_id: int, entries: tuple[tuple[str,
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _is_storage_full(exc: sqlite3.Error) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None and int(code) in (_SQLITE_FULL, _SQLITE_IOERR_FULL):
+        return True
+    name = getattr(exc, "sqlite_errorname", None)
+    if name in _FULL_ERROR_NAMES:
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _FULL_MESSAGE_MARKERS)
+
+
 def _translate_db_error(exc: sqlite3.Error) -> DirectoryError:
+    if _is_storage_full(exc):
+        return StorageFull()
     message = str(exc).lower()
     if "locked" in message or "busy" in message:
         return DatabaseBusy()
@@ -204,6 +263,7 @@ class DirectoryStore:
         *,
         timeout: float = 15.0,
         restore_lease_seconds: float = 30.0,
+        max_page_count: int | None = None,
         hooks: dict[str, Callable[[dict], None]] | None = None,
     ) -> None:
         self.db_path = str(db_path)
@@ -212,6 +272,9 @@ class DirectoryStore:
         self._hooks = dict(hooks or {})
         self._init_lock = threading.RLock()
         self._initialized = False
+        # The page cap is a per-connection SQLite setting, not stored in the
+        # database file.  Remember it so every new connection re-applies it.
+        self._max_page_count = max_page_count if max_page_count is not None else _env_page_cap()
 
     # -- infrastructure ---------------------------------------------------
 
@@ -230,6 +293,8 @@ class DirectoryStore:
         conn.execute(f"PRAGMA busy_timeout={int(self._timeout * 1000)}")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA synchronous=FULL")
+        if self._max_page_count is not None:
+            conn.execute(f"PRAGMA max_page_count={int(self._max_page_count)}")
         return conn
 
     @contextlib.contextmanager
@@ -245,6 +310,8 @@ class DirectoryStore:
             except BaseException as exc:
                 with contextlib.suppress(sqlite3.Error):
                     conn.execute("ROLLBACK")
+                if isinstance(exc, DirectoryError):
+                    raise
                 if isinstance(exc, sqlite3.Error):
                     raise _translate_db_error(exc) from exc
                 raise
@@ -288,6 +355,14 @@ class DirectoryStore:
         # A previous process may have died mid-restore.  Its lease is either
         # still live (another worker owns it) or expired and safe to reclaim.
         self.recover_stale_restore()
+        # Legacy databases accumulated one full version per commit.  Reclaim
+        # the unreachable ones now (best effort: a live restore or a locked
+        # database must not prevent startup), so their pages are available to
+        # the very first edit instead of failing against the page cap.
+        try:
+            self.reclaim_history()
+        except DirectoryError:
+            pass
 
     def _create_or_check_schema(self, conn: sqlite3.Connection) -> None:
         has_meta = conn.execute(
@@ -492,18 +567,56 @@ class DirectoryStore:
 
     # -- version helpers --------------------------------------------------
 
+    def _version_is_backed_up(self, conn: sqlite3.Connection, version_id: int) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM backups WHERE version_id=?", (version_id,)
+            ).fetchone()
+            is not None
+        )
+
+    def _discard_version(self, conn: sqlite3.Connection, version_id: int) -> None:
+        """Delete a version and its rows inside the current write transaction."""
+        conn.execute("DELETE FROM entries WHERE version_id=?", (version_id,))
+        conn.execute("DELETE FROM versions WHERE id=?", (version_id,))
+
     def _create_version(
         self, conn: sqlite3.Connection, source_version: int, kind: str, note: str
     ) -> int:
+        """Publish a complete new version copied from ``source_version``.
+
+        The caller holds the write transaction.  The new version is written as
+        a full copy so it is immutable and self-contained, but its pages do not
+        have to coexist with the pages of the version it replaces: when the
+        source is the live current version and no named backup pins it, its
+        rows are deleted first (within the same transaction) and reused for the
+        copy.  Without that, every edit would transiently need two full copies
+        and a page-capped database could not change an address even with
+        reclaimed history available.
+
+        Deleting the old rows is safe for readers: WAL snapshots keep any read
+        transaction that began earlier on the old pages, and a reader that
+        begins after the commit sees ``current_version`` already pointing at
+        the new version.  A rollback restores the old version and its rows.
+        """
+        rows = self._entries(conn, source_version)
+        self._collect_garbage(conn)
+        # Reclaim the superseded live version too when no backup pins it.  The
+        # copy is bounded by one directory, so the peak footprint stays about
+        # two full versions even though older history has just been collected.
+        if (
+            source_version == self._current_version(conn)
+            and not self._version_is_backed_up(conn, source_version)
+        ):
+            self._discard_version(conn, source_version)
         cur = conn.execute(
             "INSERT INTO versions(created_at, kind, note) VALUES (?, ?, ?)",
             (_utc_now_iso(), kind, note),
         )
         new_version = int(cur.lastrowid)
-        conn.execute(
-            "INSERT INTO entries(version_id, service, address) "
-            "SELECT ?, service, address FROM entries WHERE version_id=?",
-            (new_version, source_version),
+        conn.executemany(
+            "INSERT INTO entries(version_id, service, address) VALUES (?, ?, ?)",
+            ((new_version, service, address) for service, address in rows),
         )
         return new_version
 
@@ -513,6 +626,70 @@ class DirectoryStore:
             (version_id,),
         ).fetchall()
         return tuple((str(r["service"]), str(r["address"])) for r in rows)
+
+    # -- space reclamation ------------------------------------------------
+
+    def _collect_garbage(self, conn: sqlite3.Connection) -> int:
+        """Delete versions (and their rows) nothing can reach any more.
+
+        Must run inside a write transaction, before that transaction allocates
+        new versions.  Deleting the rows here — rather than after publishing a
+        new version — means the pages go on the freelist in the same
+        transaction and are immediately reusable, so a page-capped database can
+        perform "delete one service" and "change one address" without needing
+        new pages.  ``current_version`` and every ``backups.version_id`` stay
+        reachable, so the committed directory and all named backups are never
+        touched.  Because the collection commits (or rolls back) together with
+        the write that triggered it, a failed migration/write leaves the
+        previous directory and every backup exactly as they were.
+        """
+        current = self._current_version(conn)
+        conn.execute(
+            "DELETE FROM entries WHERE version_id<>? "
+            "AND version_id NOT IN (SELECT version_id FROM backups)",
+            (current,),
+        )
+        cur = conn.execute(
+            "DELETE FROM versions WHERE id<>? "
+            "AND id NOT IN (SELECT version_id FROM backups)",
+            (current,),
+        )
+        return max(0, int(cur.rowcount))
+
+    def reclaim_history(self) -> dict:
+        """Collect every unreferenced version; safe to call at any time.
+
+        Used at startup for databases written by older releases (which never
+        deleted versions) and exposed for operators.  It is a plain write
+        transaction, so it either frees the whole backlog or changes nothing.
+        """
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            self._require_writable(conn)
+            removed = self._collect_garbage(conn)
+            after = self._storage_info(conn)
+        return {"removed_versions": removed, "storage": after}
+
+    def storage_info(self) -> dict:
+        """Page usage, used by the page and ``/api/state`` to explain limits."""
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            return self._storage_info(conn)
+
+    @staticmethod
+    def _storage_info(conn: sqlite3.Connection) -> dict:
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        max_pages = int(conn.execute("PRAGMA max_page_count").fetchone()[0])
+        return {
+            "page_count": page_count,
+            "freelist_count": freelist,
+            "page_size": page_size,
+            "max_page_count": max_pages,
+            "bytes": page_count * page_size,
+            "limited": max_pages < SQLITE_DEFAULT_MAX_PAGE_COUNT,
+        }
 
     def _fire(self, name: str, payload: dict) -> None:
         hook = self._hooks.get(name)
@@ -551,6 +728,7 @@ class DirectoryStore:
             version = self._current_version(conn)
             rows = self._entries(conn, version)
             restore = self._restore_summary(conn)
+            storage = self._storage_info(conn)
             backups = [
                 {
                     "name": str(r["name"]),
@@ -571,6 +749,7 @@ class DirectoryStore:
                 {"service": s, "address": a} for s, a in rows
             ],
             "restore": restore,
+            "storage": storage,
             "backups": backups,
         }
 
@@ -659,6 +838,9 @@ class DirectoryStore:
                 raise InputError(f"服务数量超出上限 {MAX_SERVICES}")
             digest = _compute_digest(backup_name, version, entries)
             created_at = _utc_now_iso()
+            # Free anything unreachable *before* adding a backup row, which
+            # itself may need a page on a full database.
+            self._collect_garbage(conn)
             conn.execute(
                 "INSERT INTO backups(name, version_id, created_at, digest, entry_count) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -848,6 +1030,11 @@ class DirectoryStore:
                     )
                 validated = self._validate_backup(conn, backup_name)
                 previous = self._current_version(conn)
+                # Free the superseded live version before copying when no
+                # named backup pins it: a capped database can then restore with
+                # a peak of (pinned backup + new copy) instead of three copies.
+                if not self._version_is_backed_up(conn, previous):
+                    self._discard_version(conn, previous)
                 new_version = self._create_version(
                     conn, validated.version_id, "restore", f"恢复备份 {backup_name}"
                 )

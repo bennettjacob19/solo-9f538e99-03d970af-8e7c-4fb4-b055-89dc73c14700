@@ -15,7 +15,12 @@
 
 <main>
   {% if message %}<div class="flash ok" role="status">{{ message }}</div>{% endif %}
-  {% if error %}<div class="flash bad" role="alert">{{ error }}</div>{% endif %}
+  {% if error %}<div class="flash bad" role="alert">
+    <strong>操作未完成：</strong>{{ error }}
+    {% if error_code == 'storage_full' %}
+    <p class="small">上次提交的目录与所有命名备份均未受影响。释放空间后可直接重新提交，下面的服务名、地址和备注已保留。</p>
+    {% endif %}
+  </div>{% endif %}
 
   {% if state.restore.state == 'restoring' %}
   <div class="flash warn" role="alert">
@@ -53,22 +58,40 @@
     <h2>新增 / 修改服务</h2>
     <form method="post" action="{{ url_for('form_upsert') }}" class="grid">
       <label>服务名
-        <input name="service" required maxlength="128" placeholder="orders-api">
+        <input name="service" required maxlength="128" placeholder="orders-api" value="{{ form_service }}">
       </label>
       <label>目标地址
-        <input name="address" required maxlength="512" placeholder="10.0.0.12:8080">
+        <input name="address" required maxlength="512" placeholder="10.0.0.12:8080" value="{{ form_address }}">
       </label>
       <label>备注（可选）
-        <input name="note" maxlength="200" placeholder="变更原因">
+        <input name="note" maxlength="200" placeholder="变更原因" value="{{ form_note }}">
       </label>
       <button type="submit">保存</button>
     </form>
   </section>
 
+  {% if storage %}
+  <section class="card">
+    <h2>存储</h2>
+    <p class="muted small">
+      数据库 {{ storage.page_count }} 页 × {{ storage.page_size }} 字节
+      {%- if storage.limited %}，上限 {{ storage.max_page_count }} 页{% endif %}；
+      可复用空闲页 {{ storage.freelist_count }}。
+    </p>
+    <p class="muted small">
+      未被当前目录或命名备份引用的历史版本会自动回收并复用，因此反复改址不会让库随提交次数增长。
+      当前目录与命名备份始终保留。
+    </p>
+    <form method="post" action="{{ url_for('form_reclaim') }}" class="inline">
+      <button type="submit">立即回收历史版本</button>
+    </form>
+  </section>
+  {% endif %}
+
   <section class="card">
     <h2>命名备份</h2>
     <form method="post" action="{{ url_for('form_create_backup') }}" class="inline">
-      <input name="name" required maxlength="64" placeholder="例如 pre-change-2026-11-18">
+      <input name="name" required maxlength="64" placeholder="例如 pre-change-2026-11-18" value="{{ form_backup_name }}">
       <button type="submit">创建备份</button>
     </form>
     <p class="muted small">

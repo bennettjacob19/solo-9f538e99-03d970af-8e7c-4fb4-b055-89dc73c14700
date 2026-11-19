@@ -32,6 +32,7 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 | --- | --- | --- |
 | `SVCDIR_DB` | `data/directory.sqlite3` | SQLite 文件路径 |
 | `SVCDIR_RESTORE_LEASE_SECONDS` | `30` | 恢复租约时长（进程异常死亡后的兜底回收上限） |
+| `SVCDIR_MAX_PAGE_COUNT` | 不限制 | SQLite 页数上限；达到后写入返回 `507 storage_full` |
 | `PORT` | `8000` | 仅用于 `python -m svcdir` |
 
 ## 页面与 API
@@ -41,16 +42,20 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 | GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮 |
 | GET | `/resolve?name=<服务名>` | 返回单个服务的地址 |
 | GET | `/resolve` | 返回整个当前目录 |
-| GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表 |
+| GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表、存储页数 |
 | GET | `/api/backups` | 备份列表 |
 | POST | `/api/services` | `{"service": ..., "address": ..., "note": ...}` 新增/修改 |
 | DELETE | `/api/services/<名>` | 删除 |
 | POST | `/api/backups` | `{"name": ...}` 创建命名备份 |
 | GET | `/api/backups/<名>/validate` | 校验备份（不修改目录） |
 | POST | `/api/backups/<名>/restore` | 从备份恢复 |
+| POST | `/storage/reclaim` | 网页按钮：立即回收无可达引用的历史版本 |
 
 浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`，
-成功后 303 跳回页面并显示结果或错误。
+成功后 303 跳回页面并显示结果或错误。业务/存储错误统一返回 JSON
+`{"ok": false, "error": {"code": ..., "message": ...}}`：
+存储空间不足是独立的 `507 storage_full`，不同于通用的
+`500 database_error`。
 
 查询响应示例：
 
@@ -79,8 +84,20 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 - **恢复后新查询只见备份地址；先前受理的查询不混用两版。** 切换后新查询用新
   版本；一个在切换前开始的查询持有自己的读快照（`store.read_view()`），
   即使内部重复读取也仍是同一版本。
+- **旧历史自动回收并复用。** 每次写入先删除「既不是当前版本、也没有任何命名
+  备份引用」的版本及其行，再写新版本；释放的页在同一事务内即刻复用。删除一条
+  服务或改一个地址时，被替换的旧当前版本也会先回收（WAL 快照保证先前开始的读
+  仍然看到完整旧版），因此数据库峰值只需放得下「一份固定备份 + 一份新目录」。
+  结果是：服务数与命名备份不变时，反复改址不会让库页数随提交次数增长；达到页
+  数上限后，腾出的历史空间足以继续删除、改址和创建备份。当前目录与所有命名
+  备份永不被回收。
+- **空间不足是独立错误。** 数据库达到页数上限（或磁盘满）时，API 返回
+  `507 storage_full`（与通用的 `500 database_error` 区分）；写入事务已回滚，
+  上次提交的目录与全部备份保持不变。网页显示具体原因，并把未保存的服务名、
+  地址和备注原样填回表单；腾出空间后可直接重新提交。
 - **切换中断后重启只呈现原版或完整备份版。** 新版本与版本号切换在同一事务内
-  提交；崩在提交前 → 仍是原版，崩在提交后 → 是完整备份版，旧版本的行永不删除。
+  提交；崩在提交前 → 仍是原版，崩在提交后 → 是完整备份版。回收只删除无人引用
+  的版本，因此崩溃回滚后原版及其行仍在。
   恢复者用租约 + 操作系统文件锁（`<db>.restore.lock`）标记存活：进程死亡时
   内核释放锁，重启后立即回收被遗弃的「恢复中」标记，不必等租约到期。
 - **并发恢复。** 文件锁 + 数据库内的 `restore_state` 双重互斥，第二个恢复请求
@@ -112,6 +129,16 @@ python3 -m pytest -q
 - `test_api_flow` / `test_html_page_and_forms` / `test_html_escapes_hostile_names`
 - `test_api_validation_errors_are_json` / `test_edge_case_inputs_are_rejected_cleanly`
 
+空间回收与页数上限：
+
+- `test_reclaimed_history_keeps_page_count_flat_across_commits`（反复改址页数不变）
+- `test_capped_database_allows_delete_and_address_change`
+- `test_capped_database_can_create_backup_and_restore`
+- `test_storage_full_is_a_distinct_api_error`（507 与 500 区分）
+- `test_failed_write_keeps_last_directory_and_form_values`（原因 + 表单原样保留 + 重试）
+- `test_rollback_after_storage_full_preserves_committed_state`
+- `test_legacy_database_history_is_reclaimed_at_startup`
+
 ## 布局
 
 ```
@@ -132,6 +159,11 @@ Dockerfile / docker-compose.yml
   `flock` 的网络文件系统，会退化为「租约到期才算失效」。
 - 备份保存在同一 SQLite 数据库中，可防止误改目录，但不能防磁盘/文件损坏；
   需要异地容灾应另行导出备份文件。
+- 回收历史只释放给 SQLite 的空闲页表供**同库复用**，不会缩小文件本身；
+  达到页数上限后靠复用维持编辑，而不是把文件变小（SQLite 需 `VACUUM` 才会
+  缩小文件，且 `VACUUM` 在页数上限下无法进行）。
+- `SVCDIR_MAX_PAGE_COUNT` 是每连接 PRAGMA；多进程各自启动时会应用同一配置，
+  单进程内所有连接一致。修改它后重启即可生效，无需改写数据库。
 - 未做用户认证与 HTTPS——按需求这是本地运维工具，请只在内网使用。
 - 恢复的「已受理查询」保证依赖单个查询请求只在一个读事务里读完（当前实现如此）；
   没有为客户端提供跨多个独立 HTTP 请求的版本固定参数。

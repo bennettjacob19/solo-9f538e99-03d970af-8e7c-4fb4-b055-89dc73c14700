@@ -8,6 +8,11 @@ services:
     environment:
       SVCDIR_DB: /data/directory.sqlite3
       SVCDIR_RESTORE_LEASE_SECONDS: "30"
+      # Optional: cap the database by pages.  When the cap is reached, edits
+      # fail with a distinct 507 storage_full error rather than a generic DB
+      # error; reclaimed history is reused so changing addresses/deleting a
+      # service still works at the cap.
+      # SVCDIR_MAX_PAGE_COUNT: "1024"
     volumes:
       - svcdir-data:/data
     restart: unless-stopped
